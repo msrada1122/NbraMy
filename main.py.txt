@@ -1,0 +1,572 @@
+import os, time, subprocess, httpx, secrets, string, asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters, ConversationHandler
+)
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+
+import config, db
+
+# ================= إعدادات البوت =================
+BOT_TOKEN = config.BOT_TOKEN
+ELEVEN_API_KEY = config.ELEVEN_API_KEY
+ADMIN_IDS = [7190018043]
+OWNER_USERNAME = "@PWEEP2"
+
+# إعدادات Telethon (من حسابك المطور)
+API_ID = config.API_ID
+API_HASH = config.API_HASH
+
+# ================= إعدادات الموديلات =================
+MODEL_V3_INTERNAL = "eleven_v3"
+MODEL_V2_INTERNAL = "eleven_multilingual_v2"
+TMP = "tmp"
+os.makedirs(TMP, exist_ok=True)
+
+START_CREDITS = 5000   
+MAX_PREVIEW = 1        
+PREVIEW_TEXT = "تم الاستنساخ بنجاح."
+
+# ================= حالات تسجيل الدخول (Telethon) =================
+PHONE, CODE, PASSWORD = range(3)
+
+# ================= أدوات مساعدة =================
+def to_wav(inp, out):
+    subprocess.run(["ffmpeg", "-y", "-i", inp, "-ar", "44100", "-ac", "1", out], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+async def create_voice(wav, name):
+    async with httpx.AsyncClient(timeout=60) as c:
+        with open(wav, "rb") as f:
+            r = await c.post("https://api.elevenlabs.io/v1/voices/add", headers={"xi-api-key": ELEVEN_API_KEY}, files={"files": f}, data={"name": name, "description": "Cloned via Telegram Bot"})
+    if r.status_code != 200: raise Exception(f"API Error: {r.text}")
+    return r.json()["voice_id"]
+
+async def delete_voice_from_api(voice_id):
+    if not voice_id: return False
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.delete(f"https://api.elevenlabs.io/v1/voices/{voice_id}", headers={"xi-api-key": ELEVEN_API_KEY})
+    return r.status_code == 200
+
+async def tts(voice_id, text, model_id):
+    async with httpx.AsyncClient(timeout=60) as c:
+        settings = {"stability": 0.5, "similarity_boost": 0.75} if model_id == MODEL_V3_INTERNAL else {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}
+        r = await c.post(f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}", headers={"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"}, json={"text": text, "model_id": model_id, "voice_settings": settings})
+    if r.status_code != 200: raise Exception(f"TTS Error: {r.text}")
+    return r.content
+
+# ================= دالة الإرسال عبر Telethon (Userbot) =================
+async def send_via_userbot(user_id, file_path, caption):
+    user = db.get_user(user_id)
+    # التحقق: يجب أن يكون مشتركاً ولديه جلسة محفوظة
+    if not user or user[3] != 1 or not user[7]: 
+        return False
+
+    try:
+        # الاتصال باستخدام جلسة المستخدم وإرسال الملف لنفسه (Saved Messages)
+        async with TelegramClient(StringSession(user[7]), API_ID, API_HASH) as client:
+            await client.send_file("me", file_path, caption=caption)
+        return True
+    except Exception as e:
+        print(f"Telethon Error: {e}")
+        return False
+
+# ================= القوائم =================
+def get_main_menu(user):
+    is_paid = (user[3] == 1)
+    has_voice = (user[2] is not None and len(str(user[2])) > 5)
+    has_session = (user[7] is not None) 
+
+    keyboard = []
+
+    if is_paid:
+        # القائمة الخاصة بالمشتركين VIP
+        if has_voice:
+            keyboard.append([InlineKeyboardButton("✍️ تحويل نص إلى صوت", callback_data="write_text")])
+
+            # زر الربط يظهر فقط للمشتركين
+            if has_session:
+                keyboard.append([InlineKeyboardButton("✅ حسابك مربوط (Userbot نشط)", callback_data="telethon_info")])
+            else:
+                keyboard.append([InlineKeyboardButton("📱 ربط حسابي (لتفعيل الإرسال السري)", callback_data="telethon_start")])
+        else:
+            keyboard.append([InlineKeyboardButton("🎙️ استنساخ صوتي (تثبيت دائم)", callback_data="try_clone")])
+    else:
+        # القائمة المجانية
+        if user[4] < MAX_PREVIEW:
+            text_btn = "🔄 إعادة التجربة" if has_voice else "🎧 تجربة مجانية (مرة واحدة)"
+            keyboard.append([InlineKeyboardButton(text_btn, callback_data="try_clone")])
+        else:
+            keyboard.append([InlineKeyboardButton("⛔ انتهت التجربة (اشترك الآن)", callback_data="buy")])
+
+    keyboard.append([
+        InlineKeyboardButton("📊 الرصيد", callback_data="balance"),
+        InlineKeyboardButton("📘 تعليمات v3 والمشاعر", callback_data="help")
+    ])
+
+    # زر الشراء دائماً ظاهر
+    keyboard.append([InlineKeyboardButton("🛒 شراء الاشتراك / تفعيل كود", callback_data="buy")])
+
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_btn():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 عودة للقائمة الرئيسية", callback_data="back_home")]])
+
+# ================= /start (النص التجاري الناري 🔥) =================
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    db.create_user(uid)
+    user = db.get_user(uid)
+
+    welcome_text = (
+        "🔥 **بوت الشبح لاستنساخ الأصوات - النسخة الأصلية** 🎙️\n\n"
+        "مليت من البوتات العادية؟ تريد شي **حقيقي**؟\n"
+        "اليوم جبنالك تقنية **V3 المرعبة**.. مو بس يقلد صوتك، هذا يسرق نبرتك وإحساسك بالملي!\n\n"
+        "👁️ **شنو تكدر تسوي؟**\n"
+        "1️⃣ **استنساخ الهوية:** دز بصمة وحدة، والبوت راح يصير **أنت**.\n"
+        "2️⃣ **تحكم بالمشاعر:** خليه يضحك، يهمس، يعصب.. كله بكتابة كيبورد!\n"
+        "3️⃣ **بصمات لا تُكشف:** دزها لأصدقائك ومستحيل يعرفون أنه ذكاء اصطناعي.\n\n"
+        "💎 **للمشتركين VIP:**\n"
+        "• تثبيت صوتك للأبد (ملك لك).\n"
+        "• رصيد ضخم للكتابة.\n"
+        "• **ميزة Userbot الحصرية:** الإرسال من حسابك مباشرة! 📱\n\n"
+        "👇 **لا تضيع وقت، جرب ببلاش مرة وحدة وشوف السحر بنفسك!**"
+    )
+
+    if update.callback_query:
+        await update.callback_query.message.edit_text(welcome_text, reply_markup=get_main_menu(user), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(welcome_text, reply_markup=get_main_menu(user), parse_mode="Markdown")
+
+# ================= الأزرار والتنقل =================
+async def buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+
+    # لا نغلق التفاعل إذا كان الزر هو بداية لمحادثة تسجيل الدخول
+    if q.data != "telethon_start":
+        await q.answer()
+
+    uid = q.from_user.id
+    user = db.get_user(uid)
+
+    if q.data == "back_home":
+        ctx.user_data.clear()
+        status = "🎛️ القائمة الرئيسية"
+        if user[3] == 1: status += "\n✅ (باقة VIP مفعلة)"
+        # 🔥 تم حذف parse_mode لتجنب BadRequest Error
+        return await q.message.edit_text(status, reply_markup=get_main_menu(user))
+
+    if q.data == "buy":
+        return await q.message.edit_text(
+            "🛒 **الاشتراك المدفوع (VIP)**\n\n"
+            "📦 **احصل على القوة الكاملة:**\n"
+            f"• رصيد **{START_CREDITS} حرف** للكتابة.\n"
+            "• تثبيت صوتك المستنسخ بشكل دائم.\n"
+            "• **فتح ميزة Userbot:** إرسال البصمات كأنها منك.\n"
+            "• دعم كامل لموديل V3 (مشاعر وضحك).\n\n"
+            "💰 **السعر:**\n"
+            "• 10$ رصيد آسيا سيل\n"
+            "• 6 USDT\n\n"
+            f"📩 **لشراء كود التفعيل:** {OWNER_USERNAME}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 إدخال كود التفعيل", callback_data="enter_code")],
+                [InlineKeyboardButton("🔙 عودة", callback_data="back_home")]
+            ]),
+            parse_mode="Markdown"
+        )
+
+    if q.data == "telethon_info":
+        return await q.message.edit_text(
+            "✅ **حسابك مربوط ومفعل (Userbot Active)**\n\n"
+            "الآن أي نص تحوله لصوت، سيتم إرسال نسخة منه إلى **'الرسائل المحفوظة'** في حسابك الخاص، وكأنك أنت من سجلها.\n\n"
+            "يمكنك إعادة توجيهها لأي شخص ولن يظهر عليها 'Forwarded from Bot'.",
+            reply_markup=get_back_btn(), parse_mode="Markdown"
+        )
+
+    # --- الاستنساخ ---
+    if q.data == "try_clone":
+        if user[3] == 1 and user[2]:
+            return await q.message.edit_text("🔒 **لديك صوت مثبت بالفعل.**", reply_markup=get_back_btn(), parse_mode="Markdown")
+
+        if user[3] == 0 and user[4] >= MAX_PREVIEW:
+            return await q.message.edit_text(
+                "⛔ **انتهت التجربة.**\n"
+                "يا بطل، خلصت تجربتك المجانية.\n"
+                "تريد صوت دائم ورصيد ضخم وميزة Userbot؟ اشترك ويانا.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛒 شراء الاشتراك", callback_data="buy")],
+                    [InlineKeyboardButton("🔙 عودة", callback_data="back_home")]
+                ]),
+                parse_mode="Markdown"
+            )
+
+        if user[3] == 1:
+            return await q.message.edit_text(
+                "⚠️ **تنبيه هام للمشترك**\n"
+                "راح تسجل صوتك **الدائم** هسه.\n"
+                "تأكد أنك بمكان هادئ، لأن هذا الصوت راح يثبت بحسابك.\n"
+                "جاهز؟",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ نعم، ابدأ", callback_data="select_model_clone")],
+                    [InlineKeyboardButton("❌ إلغاء", callback_data="back_home")]
+                ]),
+                parse_mode="Markdown"
+            )
+
+        return await show_model_selection(q, "clone")
+
+    if q.data == "select_model_clone":
+        return await show_model_selection(q, "clone")
+
+    if q.data.startswith("set_model_"):
+        model_choice = q.data.split("_")[2]
+        ctx.user_data["selected_model"] = MODEL_V3_INTERNAL if model_choice == "v3" else MODEL_V2_INTERNAL
+
+        display_name = "v3" if model_choice == "v3" else "v2"
+        return await q.message.edit_text(
+            f"✅ تم اختيار: **{display_name}**\n\n"
+            "🎙️ **الآن، دز بصمة صوتية أو ملف MP3.**\n"
+            "💡 نصيحة: أحجي بشكل طبيعي لمدة 30-60 ثانية لنتيجة خرافية.",
+            reply_markup=get_back_btn(),
+            parse_mode="Markdown"
+        )
+
+    # --- الكتابة ---
+    if q.data == "write_text":
+        if not user[2]: return await q.message.edit_text("⚠️ يجب استنساخ الصوت أولاً.", reply_markup=get_back_btn())
+        return await show_model_selection(q, "write")
+
+    if q.data.startswith("use_model_"):
+        model_choice = q.data.split("_")[2]
+        ctx.user_data["selected_model"] = MODEL_V3_INTERNAL if model_choice == "v3" else MODEL_V2_INTERNAL
+        ctx.user_data["awaiting_text"] = True
+
+        display_name = "v3 (مشاعر)" if model_choice == "v3" else "v2 (قياسي)"
+        return await q.message.edit_text(
+            f"✅ الموديل: **{display_name}**\n\n✍️ **أكتب أي شي، والبوت راح يحجيه بصوتك:**",
+            reply_markup=get_back_btn(),
+            parse_mode="Markdown"
+        )
+
+    if q.data == "enter_code":
+        ctx.user_data["awaiting_code"] = True
+        return await q.message.edit_text("🔑 **أرسل كود التفعيل:**", reply_markup=get_back_btn(), parse_mode="Markdown")
+
+    if q.data == "balance":
+        return await q.message.edit_text(f"💳 **الرصيد:** `{user[5]}` حرف", reply_markup=get_back_btn(), parse_mode="Markdown")
+
+    if q.data == "help":
+         return await q.message.edit_text(
+             "📘 **الأسرار لنتائج احترافية:**\n\n"
+             "🚀 **موديل v3 (السحري):**\n"
+             "هذا الموديل يفهم المشاعر! أكتب هاي الكلمات بالأنكليزي بين قوسين قبل جملتك:\n\n"
+             "🎭 **أوامر المشاعر:**\n"
+             "• `[laugh]` : يضحك وهو يحجي.\n"
+             "• `[whisper]` : يهمس بصوت ناصي.\n"
+             "• `[angry]` : يصيح بعصبية.\n"
+             "• `[sad]` : صوته مخنوك وحزين.\n\n"
+             "📝 **مثال:**\n"
+             "`[laugh] ولك لا مستحيل! [whisper] بس دير بالك يسمعوك.`",
+             reply_markup=get_back_btn(), parse_mode="Markdown"
+         )
+
+async def show_model_selection(q, mode):
+    prefix = "set_model" if mode == "clone" else "use_model"
+    return await q.message.edit_text(
+        "⚙️ **أختار الدقة اللي تعجبك:**",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✨ v3 (سريع + مشاعر حقيقية)", callback_data=f"{prefix}_v3")],
+            [InlineKeyboardButton("🤖 v2 (رسمي ومستقر)", callback_data=f"{prefix}_v2")],
+            [InlineKeyboardButton("🔙 إلغاء", callback_data="back_home")]
+        ]),
+        parse_mode="Markdown"
+    )
+
+# ================= LOGIN CONVERSATION (Telethon) =================
+# 1. طلب الرقم
+async def telethon_start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await query.message.reply_text(
+        "📱 **ربط الحساب (تفعيل Userbot)**\n\n"
+        "لإرسال البصمات من حسابك مباشرة، يرجى إرسال **رقم هاتفك** مع الرمز الدولي.\n\n"
+        "📝 مثال: `+9647700000000`\n\n"
+        "🔐 **بياناتك آمنة:** نستخدمها مرة واحدة فقط لإنشاء الجلسة.",
+        reply_markup=get_back_btn(),
+        parse_mode="Markdown"
+    )
+    return PHONE
+
+# 2. إرسال كود التحقق (مع التنبيه على المسافات)
+async def login_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip().replace(" ", "")
+
+    msg = await update.message.reply_text("⏳ **جاري الاتصال بسيرفرات تيليجرام...**", parse_mode="Markdown")
+
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        try:
+            phone_code_hash = await client.send_code_request(phone)
+
+            ctx.user_data['telethon_client'] = client
+            ctx.user_data['phone'] = phone
+            ctx.user_data['phone_code_hash'] = phone_code_hash.phone_code_hash
+
+            # 🔥🔥🔥 التحذير الهام 🔥🔥🔥
+            await msg.edit_text(
+                "✅ **تم إرسال الكود!**\n\n"
+                "⚠️ **هام جداً لتجنب الحظر:**\n"
+                "أرسل الكود مع **مسافات** بين الأرقام لكي يقبله النظام.\n"
+                "✅ **صحيح:** `1 2 3 4 5`\n"
+                "❌ **خطأ:** `12345`\n\n"
+                "أنتظر الكود...",
+                parse_mode="Markdown"
+            )
+            return CODE
+        except Exception as e:
+            await client.disconnect()
+            await msg.edit_text(f"❌ خطأ في الرقم: {e}", reply_markup=get_back_btn())
+            return ConversationHandler.END
+    else:
+        await msg.edit_text("⚠️ أنت مسجل دخول بالفعل!", reply_markup=get_back_btn())
+        await client.disconnect()
+        return ConversationHandler.END
+
+# 3. التحقق من الكود (مع التنظيف)
+async def login_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # 🔥 تنظيف الكود من المسافات والشخطات
+    code = update.message.text.strip().replace(" ", "").replace("-", "")
+
+    client = ctx.user_data['telethon_client']
+    phone = ctx.user_data['phone']
+    phone_code_hash = ctx.user_data['phone_code_hash']
+
+    msg = await update.message.reply_text("⏳ **جاري التحقق...**")
+
+    try:
+        await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+
+        session_string = client.session.save()
+        db.update(update.effective_user.id, "session_string", session_string)
+        await client.disconnect()
+
+        await msg.edit_text(
+            "🎉 **تم ربط الحساب بنجاح!**\n\n"
+            "ميزة **Userbot** مفعلة الآن.\n"
+            "أي صوت تسويه راح يوصلك على 'الرسائل المحفوظة' مباشرة.",
+            reply_markup=get_main_menu(db.get_user(update.effective_user.id)),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+    except SessionPasswordNeededError:
+        await msg.edit_text("🔐 **حسابك محمي (2FA).**\nيرجى إرسال كلمة المرور الخاصة بحسابك.")
+        return PASSWORD
+
+    except PhoneCodeInvalidError:
+        await msg.edit_text("❌ الكود غلط (تأكد أنك وضعت مسافات). حاول مرة ثانية.")
+        return CODE 
+
+    except Exception as e:
+        await client.disconnect()
+        await msg.edit_text(f"❌ حدث خطأ: {e}", reply_markup=get_back_btn())
+        return ConversationHandler.END
+
+# 4. التحقق من الباسورد (2FA)
+async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+    client = ctx.user_data['telethon_client']
+
+    msg = await update.message.reply_text("⏳ **جاري فك التشفير...**")
+
+    try:
+        await client.sign_in(password=password)
+
+        session_string = client.session.save()
+        db.update(update.effective_user.id, "session_string", session_string)
+        await client.disconnect()
+
+        await msg.edit_text(
+            "🎉 **تم فتح القفل وربط الحساب!**\nUserbot Active ✅",
+            reply_markup=get_main_menu(db.get_user(update.effective_user.id)),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        await client.disconnect()
+        await msg.edit_text(f"❌ الباسورد غلط: {e}", reply_markup=get_back_btn())
+        return ConversationHandler.END
+
+async def cancel_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if 'telethon_client' in ctx.user_data:
+        await ctx.user_data['telethon_client'].disconnect()
+    await update.message.reply_text("❌ تم الإلغاء.", reply_markup=get_back_btn())
+    return ConversationHandler.END
+
+# ================= Handlers Normal =================
+async def audio_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = db.get_user(uid)
+
+    if "selected_model" not in ctx.user_data: return
+
+    selected_model = ctx.user_data["selected_model"]
+    del ctx.user_data["selected_model"] 
+    display_model_name = "v3" if selected_model == MODEL_V3_INTERNAL else "v2"
+
+    msg = await update.message.reply_text("⏳ **جاري تحليل نبرة الصوت...**", parse_mode="Markdown")
+
+    try:
+        tg_file = await (update.message.voice or update.message.audio).get_file()
+        file_path = f"{TMP}/{uid}_{int(time.time())}.wav"
+        await tg_file.download_to_drive(file_path)
+
+        final_wav = f"{TMP}/{uid}_final.wav"
+        to_wav(file_path, final_wav)
+
+        await msg.edit_text("🧬 **جاري استنساخ الهوية الصوتية...**")
+        voice_id = await create_voice(final_wav, f"User_{uid}")
+
+        db.update(uid, "voice_id", voice_id)
+        db.update(uid, "preview_count", user[4] + 1)
+
+        await msg.edit_text(f"🎙️ **جاري إعداد التجربة ({display_model_name})...**")
+        audio = await tts(voice_id, PREVIEW_TEXT, selected_model)
+
+        out_mp3 = f"{TMP}/{uid}_preview.mp3"
+        with open(out_mp3, "wb") as f: f.write(audio)
+
+        await msg.delete()
+
+        caption = f"✅ **تم الاستنساخ بنجاح!**\nجودة: {display_model_name}"
+        if user[3] == 1: caption += "\n🔒 **تم تثبيت هويتك الصوتية.**"
+
+        await update.message.reply_audio(audio=open(out_mp3, "rb"), caption=caption, reply_markup=get_back_btn(), parse_mode="Markdown")
+
+    except Exception as e:
+        await msg.edit_text(f"❌ حدث خطأ:\n{str(e)}", reply_markup=get_back_btn(), parse_mode=None)
+
+async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = db.get_user(uid)
+    text = update.message.text.strip()
+
+    if ctx.user_data.get("awaiting_code"):
+        if not db.is_code_valid(text):
+            return await update.message.reply_text("❌ الكود غلط، تأكد منه.", reply_markup=get_back_btn())
+
+        db.mark_code_used(text)
+        db.activate_user(uid, START_CREDITS)
+
+        # تنظيف الصوت القديم
+        if user[2]:
+            try: await delete_voice_from_api(user[2])
+            except: pass
+
+        db.update(uid, "voice_id", None)
+        ctx.user_data["awaiting_code"] = False
+        user = db.get_user(uid)
+
+        return await update.message.reply_text(
+            f"🎉 **مبروك التفعيل يا بطل!**\n"
+            f"💰 نزل بحسابك: **5000 حرف**.\n"
+            f"تم فتح ميزة **Userbot** 📱.\n"
+            f"هسه لازم نسجل صوتك الدائمي.. أضغط على **'استنساخ صوتي'**.",
+            reply_markup=get_main_menu(user),
+            parse_mode="Markdown"
+        )
+
+    if ctx.user_data.get("awaiting_text"):
+        ctx.user_data["awaiting_text"] = False
+
+        if not user[2]:
+            return await update.message.reply_text("⚠️ ما عندك صوت محفوظ بعدك.", reply_markup=get_back_btn())
+
+        if len(text) > user[5]:
+             return await update.message.reply_text("❌ رصيدك خلص، لازم تشحن.", reply_markup=get_back_btn())
+
+        selected_model = ctx.user_data.get("selected_model", MODEL_V2_INTERNAL)
+        display_name = "v3" if selected_model == MODEL_V3_INTERNAL else "v2"
+
+        msg = await update.message.reply_text(f"⏳ **جاري التوليد ({display_name})...**", parse_mode="Markdown")
+        try:
+            audio = await tts(user[2], text, selected_model)
+            db.deduct_credits(uid, len(text))
+
+            out = f"{TMP}/{uid}_tts.mp3"
+            with open(out, "wb") as f: f.write(audio)
+
+            await msg.delete()
+
+            # 1. الإرسال في البوت (طبيعي)
+            await update.message.reply_audio(audio=open(out, "rb"), caption=f"✅ المتبقي: {db.get_user(uid)[5]} حرف", reply_markup=get_back_btn())
+
+            # 2. الإرسال عبر Userbot (إذا كان مربوطاً)
+            if user[7]: # لديه جلسة
+                 sent = await send_via_userbot(uid, out, text)
+                 if sent:
+                     await update.message.reply_text("📱 **تم إرسال نسخة لرسائلك المحفوظة!**")
+
+        except Exception as e:
+            await msg.edit_text(f"❌ خطأ:\n{str(e)}", reply_markup=get_back_btn(), parse_mode=None)
+
+# ================= Admin Commands =================
+async def gen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(12))
+    db.add_code(code)
+    await update.message.reply_text(f"🔑 `{code}`", parse_mode="Markdown")
+
+async def reset_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    uid = update.effective_user.id
+    db.reset_user_data(uid)
+    await update.message.reply_text("✅ Reset Done.")
+
+async def clean_trash(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    status_msg = await update.message.reply_text("🧹 **جاري تنظيف الحساب...**")
+    rows = db.get_unpaid_voice_owners()
+    if not rows: return await status_msg.edit_text("✅ الحساب نظيف.")
+    c = 0
+    for r in rows:
+        if r[1]: 
+            try: 
+                await delete_voice_from_api(r[1])
+                db.update(r[0], "voice_id", None)
+                c+=1
+            except: pass
+    await status_msg.edit_text(f"✅ **تم التنظيف!**\nتم حذف {c} صوت.")
+
+if __name__ == "__main__":
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # معالج تسجيل الدخول (Conversation)
+    login_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(telethon_start_handler, pattern="^telethon_start$")],
+        states={
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
+            CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_code)],
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_login)]
+    )
+
+    app.add_handler(login_handler)
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("gen", gen))
+    app.add_handler(CommandHandler("reset", reset_user))
+    app.add_handler(CommandHandler("clean_trash", clean_trash))
+    app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, audio_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    print("Bot Started...")
+    app.run_polling(drop_pending_updates=True)
